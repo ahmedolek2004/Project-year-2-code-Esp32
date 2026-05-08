@@ -13,30 +13,27 @@
 #define USER_EMAIL   "strip001@smartstrip.local"
 #define USER_PASS    "123456"
 
-// ── Strip ID ──────────────────────────────────────────────────
 String stripId = "strip001";
 
 // ── Pins ──────────────────────────────────────────────────────
 int relayPins[8] = {13, 12, 14, 27, 26, 25, 33, 32};
-const int voltPin = 34;   // ZMPT101B
-const int currPin = 35;   // ACS712
+const int voltPin = 34;   
+const int currPin = 35;   
 
-// ── Sensor calibration ────────────────────────────────────────
-float vCalibration    = 530.0;
-float currSensitivity = 0.066;
-float vOffset         = 1.65;
+// ── Sensor calibration & Stability ────────────────────────────
+float vCalibration    = 480.0; // تم تعديلها بناءً على الصورة لتقليل الخطأ
+float currSensitivity = 0.066; 
+float vOffset         = 1.65;  // سيتم تحديثها تلقائياً في setup
+float iOffset         = 1.65;  // سيتم تحديثها تلقائياً في setup
 
-// ── Firebase objects ──────────────────────────────────────────
 FirebaseData fbdo;
 FirebaseAuth auth;
 FirebaseConfig config;
 
-// ── NTP (time) ────────────────────────────────────────────────
 WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP, "pool.ntp.org", 3600 * 2);
 
-// ── Timers ────────────────────────────────────────────────────
-unsigned long lastRelayCheck    = 0;
+unsigned long lastRelayCheck     = 0;
 unsigned long lastRealtimeUpdate = 0;
 unsigned long lastMonthlyUpdate  = 0;
 
@@ -44,48 +41,40 @@ unsigned long lastMonthlyUpdate  = 0;
 void setup() {
   Serial.begin(115200);
 
-  // Set all relays OFF on boot
   for (int i = 0; i < 8; i++) {
     pinMode(relayPins[i], OUTPUT);
     digitalWrite(relayPins[i], LOW);
   }
 
-  // Connect to WiFi
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.print("Connecting to WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  
+  // معايرة نقطة الصفر تلقائياً (Auto-Calibration)
+  // تأكد من عدم وجود أحمال عند بدء التشغيل
+  long vSum = 0;
+  long iSum = 0;
+  for(int i=0; i<1000; i++) {
+    vSum += analogRead(voltPin);
+    iSum += analogRead(currPin);
+    delay(1);
   }
-  Serial.println("\nWiFi connected: " + WiFi.localIP().toString());
-
-  // Firebase config
-  config.api_key      = API_KEY;
+  vOffset = (vSum / 1000.0) * (3.3 / 4095.0);
+  iOffset = (iSum / 1000.0) * (3.3 / 4095.0);
+  
+  config.api_key = API_KEY;
   config.database_url = DATABASE_URL;
-
-  // FIX 1: Authenticate with email + password
-  // Without this, Firebase rejects every read and write
-  auth.user.email    = USER_EMAIL;
+  auth.user.email = USER_EMAIL;
   auth.user.password = USER_PASS;
 
   Firebase.begin(&config, &auth);
   Firebase.reconnectWiFi(true);
-
-  // Wait until Firebase is ready and authenticated
-  Serial.print("Authenticating with Firebase");
-  while (!Firebase.ready()) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("\nFirebase ready");
-
-  // Start NTP time client
+  
   timeClient.begin();
   timeClient.update();
+  Serial.println("\nSystem Ready");
 }
 
-// ─────────────────────────────────────────────────────────────
-// Read RMS voltage from ZMPT101B
+// ── قراءة الجهد مع الحماية ───────────────────────────────────
 float getVrms() {
   float vSum = 0;
   int samples = 500;
@@ -94,42 +83,41 @@ float getVrms() {
     vSum += v * v;
     delayMicroseconds(500);
   }
-  return sqrt(vSum / samples) * vCalibration;
+  float vRMS = sqrt(vSum / samples) * vCalibration;
+  return (vRMS < 15.0) ? 0 : vRMS; // إذا كان أقل من 15 فولت اعتبره 0
 }
 
-// Read RMS current from ACS712
+// ── قراءة التيار مع تصفية الضوضاء ──────────────────────────────
 float getIrms() {
   float iSum = 0;
   int samples = 500;
   for (int i = 0; i < samples; i++) {
-    float v = (analogRead(currPin) * (3.3 / 4095.0)) - vOffset;
+    float v = (analogRead(currPin) * (3.3 / 4095.0)) - iOffset;
     iSum += v * v;
     delayMicroseconds(500);
   }
-  return sqrt(iSum / samples) / currSensitivity;
+  float iRMS = sqrt(iSum / samples) / currSensitivity;
+  
+  // أهم تعديل: لا يقرأ تيار إلا إذا تجاوز 0.12 أمبير (حوالي 26 وات)
+  if (iRMS < 0.12) iRMS = 0.0; 
+  return iRMS;
 }
 
-// ─────────────────────────────────────────────────────────────
 void loop() {
   timeClient.update();
 
-  // FIX 3: Check relays every 2 seconds — not every loop tick
-  // Reading 8 paths per loop was hammering Firebase and causing timeouts
+  // تحديث حالة الريلاي (كل 2 ثانية لتجنب الضغط على السيرفر)
   if (millis() - lastRelayCheck > 2000) {
     lastRelayCheck = millis();
-
     for (int i = 0; i < 8; i++) {
       String path = "/powerstrips/" + stripId + "/outlets/" + String(i) + "/on";
       if (Firebase.getBool(fbdo, path)) {
-        bool shouldBeOn = fbdo.boolData();
-        digitalWrite(relayPins[i], shouldBeOn ? HIGH : LOW);
-      } else {
-        Serial.println("Relay read failed [" + String(i) + "]: " + fbdo.errorReason());
+        digitalWrite(relayPins[i], fbdo.boolData() ? HIGH : LOW);
       }
     }
   }
 
-  // Send live sensor readings every 5 seconds
+  // إرسال البيانات المباشرة (كل 5 ثوانٍ)
   if (millis() - lastRealtimeUpdate > 5000) {
     lastRealtimeUpdate = millis();
 
@@ -137,76 +125,59 @@ void loop() {
     float iRMS  = getIrms();
     float power = vRMS * iRMS;
 
-    // FIX 2: ts must be a NUMBER (milliseconds), not a string
-    // The website does new Date(ts) which only works with a number
+    // في حال عدم وجود تيار، صفر القدرة تماماً
+    if (iRMS <= 0.0) power = 0.0;
+
     unsigned long long ts = (unsigned long long)timeClient.getEpochTime() * 1000ULL;
 
     FirebaseJson json;
     json.set("voltage", vRMS);
     json.set("current", iRMS);
     json.set("power",   power);
-    json.set("ts",      (double)ts);   // double keeps full precision in FirebaseESP32
+    json.set("ts",      (double)ts);
 
-    if (Firebase.setJSON(fbdo, "/powerstrips/" + stripId + "/realtime", json)) {
-      Serial.printf("Realtime sent — V:%.1f  I:%.2f  W:%.0f\n", vRMS, iRMS, power);
-    } else {
-      Serial.println("Realtime send failed: " + fbdo.errorReason());
-    }
+    Firebase.setJSON(fbdo, "/powerstrips/" + stripId + "/realtime", json);
+    Serial.printf("V: %.1fV | I: %.2fA | P: %.1fW\n", vRMS, iRMS, power);
   }
 
-  // Update monthly energy log every hour
+  // التحديث الشهري
   if (millis() - lastMonthlyUpdate > 3600000) {
     lastMonthlyUpdate = millis();
     updateMonthlyLog();
   }
 }
 
-// ─────────────────────────────────────────────────────────────
 void updateMonthlyLog() {
-
-  // Build "YYYY-MM" key from current time
   time_t rawtime = timeClient.getEpochTime();
   struct tm* ti  = localtime(&rawtime);
   char yearMonth[8];
   sprintf(yearMonth, "%04d-%02d", ti->tm_year + 1900, ti->tm_mon + 1);
   String monthPath = "/powerstrips/" + stripId + "/monthly/" + String(yearMonth);
 
-  float oldKwh = 0, oldCost = 0, rate = 0.12;
+  float oldKwh = 0, rate = 0.127; // السعر كما في الصورة
 
-  // FIX 4: Read the existing monthly JSON FIRST, copy data out before any other Firebase call
-  // In the old code, a second Firebase call overwrote fbdo making the first JSON unreadable
   if (Firebase.getJSON(fbdo, monthPath)) {
     FirebaseJsonData res;
     FirebaseJson json;
-    json.setJsonData(fbdo.stringData());          // copy data out of fbdo safely
-
+    json.setJsonData(fbdo.stringData());
     json.get(res, "kwh_total");
     if (res.success) oldKwh = res.floatValue;
-
-    json.get(res, "cost");
-    if (res.success) oldCost = res.floatValue;
   }
 
-  // THEN read the rate (this overwrites fbdo — safe now because we already copied above)
   if (Firebase.getFloat(fbdo, "/powerstrips/" + stripId + "/config/rate")) {
     rate = fbdo.floatData();
   }
 
-  // Measure power right now for the hourly energy estimate
-  float vRMS         = getVrms();
-  float iRMS         = getIrms();
-  float energyKwh    = (vRMS * iRMS) / 1000.0;   // watts → kilowatts × 1 hour
+  float vRMS = getVrms();
+  float iRMS = getIrms();
+  float energyKwh = (vRMS * iRMS * 1.0) / 1000.0; // استهلاك ساعة واحدة
 
-  float updatedKwh   = oldKwh  + energyKwh;
-  float updatedCost  = updatedKwh * rate;
+  float updatedKwh  = oldKwh + energyKwh;
+  float updatedCost = updatedKwh * rate;
 
   FirebaseJson update;
   update.set("kwh_total", updatedKwh);
   update.set("cost",      updatedCost);
 
-  if (Firebase.setJSON(fbdo, monthPath, update)) {
-    Serial.printf("Monthly updated — %s  kWh:%.4f  Cost:$%.4f\n", yearMonth, updatedKwh, updatedCost);
-  } else {
-    Serial.println("Monthly update failed: " + fbdo.errorReason());
-  }
+  Firebase.setJSON(fbdo, monthPath, update);
 }
